@@ -3,7 +3,7 @@
 obfuscation = false
 
 [python.dependencies]
-common = ["py_trees==2.4.0"]
+common = []
 
 [platform]
 supports = ["sim_x86_64", "sim_aarch64", "real_jetson"]

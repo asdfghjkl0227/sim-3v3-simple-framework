@@ -15,8 +15,10 @@ from ..param import (
     GLOBAL_FIELD_MARGIN_M,
     GLOBAL_GRID_RESOLUTION_M,
     GLOBAL_OBSTACLE_MARGIN_M,
+    HALF_SAFE_MARGIN_M,
 )
 from .obstacles import Obstacle
+from .rules import segment_clear, bounds
 
 
 def plan_global_path(
@@ -24,16 +26,24 @@ def plan_global_path(
     start: tuple[float, float],
     target: tuple[float, float],
     obstacles: list[Obstacle],
+    *, own_half: bool = False, ball_access: bool = False,
 ) -> list[tuple[float, float]] | None:
     """Return an A* path from start to target, or None if no path is found."""
     min_x, max_x, min_y, max_y = _bounds(context)
+    if ball_access:
+        min_x,max_x,min_y,max_y = bounds(context,own_half,ball_access=True)
+    if own_half:
+        # 从对方半场返程时保留起点到中线的走廊；合法后不再规划越半场。
+        max_x = min(max_x,max(-HALF_SAFE_MARGIN_M,start[0]))
     sx, sy = _clamp_point(start[0], start[1], min_x, max_x, min_y, max_y)
     tx, ty = _clamp_point(target[0], target[1], min_x, max_x, min_y, max_y)
 
     start_idx = _to_idx(sx, sy, min_x, min_y)
     goal_idx = _to_idx(tx, ty, min_x, min_y)
+    if _blocked(tx, ty, obstacles):
+        return None
     if start_idx == goal_idx:
-        return [(tx, ty)]
+        return [(tx, ty)] if segment_clear(start,target,obstacles,GLOBAL_OBSTACLE_MARGIN_M) else None
 
     open_heap: list[tuple[float, int, tuple[int, int]]] = []
     counter = 0
@@ -47,18 +57,23 @@ def plan_global_path(
         if current in closed:
             continue
         if current == goal_idx:
-            return _reconstruct(came_from, current, min_x, min_y, (tx, ty))
+            path = _reconstruct(came_from, current, min_x, min_y, (tx, ty))
+            path[0] = start
+            if all(segment_clear(a,b,obstacles,GLOBAL_OBSTACLE_MARGIN_M)
+                   for a,b in zip(path,path[1:])):
+                return path
+            return None
         closed.add(current)
 
         for neighbor, step_cost in _neighbors(current):
             x, y = _to_xy(neighbor, min_x, min_y)
             if not (min_x <= x <= max_x and min_y <= y <= max_y):
                 continue
-            if (
-                neighbor != start_idx
-                and neighbor != goal_idx
-                and _blocked(x, y, obstacles)
-            ):
+            point = _to_xy(current,min_x,min_y)
+            if own_half and point[0] > -HALF_SAFE_MARGIN_M and x > point[0]:
+                continue
+            if _blocked(x,y,obstacles) or not segment_clear(
+                    point,(x,y),obstacles,GLOBAL_OBSTACLE_MARGIN_M):
                 continue
             tentative = g_score[current] + step_cost
             if tentative >= g_score.get(neighbor, math.inf):

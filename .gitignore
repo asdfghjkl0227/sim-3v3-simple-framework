@@ -1,6 +1,16 @@
 # Booster Studio / colcon build & runtime outputs
 log/
 install/
+logs/
+
+# Keep the shared soccer scene configuration; ignore Studio local state.
+/.booster-studio/*
+!/.booster-studio/project.json
+
+# Local simulation backups and machine-specific verification output
+/strategy-before-*.zip
+/winning-strategy-*.zip
+/docs/winning-source-sha256.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -53,6 +63,7 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.ruff_cache/
 cover/
 
 # Translations
@@ -110,6 +121,10 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
 .venv
 env/
 venv/
@@ -145,10 +160,12 @@ cython_debug/
 .vscode/
 .idea/
 *.swp
+*.swo
 *~
 
 # OS
 Thumbs.db
+Desktop.ini
 .DS_Store
 
 old_src/*

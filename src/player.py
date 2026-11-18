@@ -18,7 +18,7 @@ import logging
 import math
 from typing import TYPE_CHECKING
 
-from .framework.types import Context, Penalty, Pose2D
+from .framework.types import Context, Penalty, Pose2D, GameState, SetPlay, KICKING_TEAM_NONE
 from .framework import debugdraw
 
 from .param import *
@@ -31,8 +31,9 @@ from .utils.geom import (
     own_goal,
     own_goal_area_center,
 )
-from .utils.obstacles import collect_obstacles
+from .utils.obstacles import collect_obstacles, Obstacle
 from .utils.path_planner import plan_global_path
+from .utils.rules import legal_target, safe_velocity, safe_push_direction, segment_clear, goal_danger, live_ball_access
 
 if TYPE_CHECKING:
     from .framework.config import SoccerConfig
@@ -111,6 +112,26 @@ class Player:
 
         # 踢球迟滞状态(跨帧)
         self._kicking: bool = False
+        self.rule_discs: list[Obstacle] = []
+        self.rule_own_half = False
+        self.rule_can_kick = False
+        self.rule_shot_origin = None
+        self.ball_access = False
+        self._activity_anchor = None
+        self._activity_since = None
+        self._retreating = False
+        self._rescue_target = None
+        self._recovering = False
+        self._get_up_requested_at = None
+        self.ball_motion = None
+        self.evaluation = None
+        self._nav_anchor = None
+        self._nav_since = None
+        self._nav_goal = None
+        self._nav_detour = None
+        self._nav_detour_until = 0.0
+        self._nav_attempt = 0
+        self.routing_blocked_until = 0.0
 
         # block/guard 的跨帧迟滞状态
         self._block_pressing: bool = False
@@ -172,6 +193,15 @@ class Player:
     # ------------------------------------------------------------------
 
     def set_velocity(self, vx: float, vy: float, vyaw: float) -> None:
+        if not self._motion_allowed() or self.pose is None or self.is_fallen:
+            self.release_kick()
+            vx = vy = vyaw = 0.0
+        elif vx or vy:
+            pose = self.pose
+            c, s = math.cos(pose.theta), math.sin(pose.theta)
+            wx, wy = safe_velocity(self.context, pose, vx*c-vy*s, vx*s+vy*c,
+                                   self.rule_discs, self.rule_own_half,ball_access=self.ball_access)
+            vx, vy = wx*c+wy*s, -wx*s+wy*c
         if self._backend is None:
             _log.debug(
                 "player %d set_velocity vx=%.3f vy=%.3f vyaw=%.3f (no backend)",
@@ -179,6 +209,11 @@ class Player:
             )
             return
         self._backend.set_velocity(vx, vy, vyaw)
+
+    def _motion_allowed(self) -> bool:
+        g = self.context.game if self.context is not None else None
+        return (g is not None and not g.stopped and not self.is_penalized
+                and g.state in (GameState.READY, GameState.PLAYING))
 
     def stop(self) -> None:
         self.release_kick()
@@ -194,19 +229,68 @@ class Player:
         power: float = KICK_POWER_DEFAULT,
     ) -> None:
         pose = self.pose
-        if pose is None:
-            _log.warning("player %d kick skipped: pose unknown", self.id)
+        g = self.context.game if self.context is not None else None
+        if (not self._motion_allowed() or g.state != GameState.PLAYING
+                or not self.rule_can_kick or self.is_fallen or pose is None
+                or (g.kicking_team not in (self.context.team_id, KICKING_TEAM_NONE)
+                    and (g.set_play != SetPlay.NONE or g.secondary_time > 0))):
+            self.stop()
             return
 
         ball = self.context.ball if self.context is not None else None
         if ball is None:
-            _log.warning("player %d kick skipped: ball unknown", self.id)
+            self.stop()
             return
+
+        # 活球处理者可用边线外短绕行空间；官方禁圈仍然检查。
+        # 主罚接近球不套用普通走位的0.3m半场余量；下面单独检查主罚中线余量。
+        legal_pose = legal_target(self.context, (pose.x,pose.y), self.rule_discs, False,
+                                  ball_access=live_ball_access(self.context))
+        # 门线上仍是活球。救险只缩小边界工程余量，绝不绕过暂停/罚下/禁圈。
+        rescue = goal_danger(self.context) and not self.rule_own_half
+        in_field = (abs(pose.x) <= self.context.field.length/2-GOAL_LINE_KICK_FIELD_MARGIN_M
+                    and abs(pose.y) <= self.context.field.width/2-GOAL_LINE_KICK_FIELD_MARGIN_M)
+        goal_pocket = (-self.context.field.length/2-GOAL_DEPTH+GOAL_RESCUE_BACK_MARGIN_M <= pose.x
+                       <= -self.context.field.length/2+FIELD_SAFE_MARGIN_M
+                       and abs(pose.y)<self.context.field.goal_width/2-GOAL_RESCUE_POST_MARGIN_M)
+        pose_clear = all(dist(pose.x,pose.y,c.x,c.y) >= c.radius+RULE_TARGET_MARGIN_M for c in self.rule_discs)
+        if any(math.hypot(ball.x-c.x,ball.y-c.y) < c.radius for c in self.rule_discs):
+            self.stop()
+            return
+        if legal_pose != (pose.x,pose.y) and not (rescue and (in_field or goal_pocket) and pose_clear):
+            # SDK接近后可能把人带过边界余量；主动走回内场，不能永远只取消任务。
+            recovery = legal_target(self.context,(pose.x,pose.y),self.rule_discs,self.rule_own_half)
+            if recovery is not None:
+                self.action = 'kick:return_infield'
+                self.walk_to(recovery,ball_access=True)
+            else:
+                self.stop()
+            return
+        if self.rule_own_half and (ball.x > KICKOFF_TAKER_LINE_MARGIN_M
+                                  or pose.x > -KICKOFF_TAKER_LINE_MARGIN_M):
+            self.walk_to((min(pose.x,-HALF_SAFE_MARGIN_M),pose.y))
+            return
+
+        if rescue:
+            target = self.clearance_target()
+            kick_direction = angle_to(ball.x,ball.y,*target)
+            power = SHOT_POWER
+
+        restricted = self.rule_shot_origin is not None and dist(
+            ball.x, ball.y, *self.rule_shot_origin) <= RESTART_SHOT_DISTANCE_M
+        if restricted:
+            kick_direction = safe_push_direction(self.context)
+            if self.rule_own_half:
+                kick_direction = KICKOFF_SIDE_ANGLE_RAD
+            power = RESTART_PUSH_POWER
+            if kick_direction is None:
+                self.stop()
+                return
 
         if kick_direction is None:
             kick_plan = self.plan_kick()
             if kick_plan is None:
-                _log.warning("player %d kick skipped: kick plan unavailable", self.id)
+                self.stop()
                 return
             kick_direction, power = kick_plan
 
@@ -226,13 +310,18 @@ class Player:
         kick_direction = normalize_angle(kick_direction)
         direction_body = normalize_angle(kick_direction - pose.theta)
         power_clamped = max(KICK_POWER_MIN, min(KICK_POWER_MAX, power))
+        if self.ball_motion is not None:
+            self.ball_motion.observe_kick_request(self.context,self.id,power_clamped,kick_direction)
         self._kicking = True
         self._backend.kick(direction_body, power_clamped, ball_x_body, ball_y_body)
+        if self.evaluation is not None and dist(pose.x,pose.y,ball.x,ball.y) <= BALL_KICK_ENGAGE_M:
+            self.evaluation.record_kick(self.context,self.id,
+                (ball.x+math.cos(kick_direction),ball.y+math.sin(kick_direction)))
 
     def plan_kick(self) -> tuple[float, float] | None:
         """计算踢球方向和力度。
 
-        从当前球位踢向对方球门中心,力度 2.0。
+        从当前球位踢向对方球门中心；实际执行仍经过 kick 的合规闸门。
         返回 ``(kick_direction, kick_power)``;球或上下文不可用时返回 None。
         """
         ctx = self.context
@@ -330,12 +419,18 @@ class Player:
     # ------------------------------------------------------------------
 
     def request_mode(self, mode: str) -> None:
+        if not self._motion_allowed():
+            self.stop()
+            return
         if self._backend is None:
             _log.debug("player %d request_mode -> %s (no backend)", self.id, mode)
             return
         self._backend.request_mode(mode)
 
     def get_up(self) -> None:
+        if not self._motion_allowed():
+            self.stop()
+            return
         if self._backend is None:
             _log.debug("player %d get_up (no backend)", self.id)
             return
@@ -346,14 +441,31 @@ class Player:
     # ------------------------------------------------------------------
 
     def ensure_ready(self) -> bool:
-        """活性自理:摔倒→起身,非 walk→切模式(都异步、不产生移动)。
+        """允许运动时异步起身/切模式；起身会移动，停止阶段禁止新启动。
 
         返回本帧是否可执行动作(True=已就绪)。
         """
-        if self.is_fallen:
-            self.get_up()
+        if not self._motion_allowed():
+            self.stop()
+            return False
+        if self._recovering and self.fall_down_state == "normal":
+            self._recovering = False
+            self._get_up_requested_at = None
+        if self.is_fallen or self._recovering:
+            self.stop()
+            # get_up 是异步任务，后台“调用返回”不等于机器人已站起。
+            # 只在 SDK 的 recoverable 明确允许时发起；等待期间不抢发 walk。
+            recoverable = getattr(self._backend,"fall_down_recoverable",False)
+            now = self.context.now
+            if (recoverable and self.fall_down_state != "getting_up"
+                    and (self._get_up_requested_at is None
+                                or now-self._get_up_requested_at >= GET_UP_RETRY_S)):
+                self._recovering = True
+                self._get_up_requested_at = now
+                self.get_up()
             return False
         if self.mode != "walk":
+            self.stop()
             self.request_mode("walk")
             return False
         return True
@@ -366,6 +478,48 @@ class Player:
         err = normalize_angle(target_theta - self.pose.theta)
         self.set_velocity(0.0, 0.0, self._angular(err))
 
+    def reset_navigation(self):
+        """阶段变化/返场清除旧路线和卡住记忆，当帧按新局势决策。"""
+        self._nav_anchor = self._nav_since = self._nav_goal = self._nav_detour = None
+        self._nav_detour_until = self.routing_blocked_until = 0.0
+        self._activity_anchor = self._activity_since = None
+        self._retreating = False
+        self._rescue_target = None
+
+    def _navigation_target(self,target,obstacles):
+        pose,now = self.pose,self.context.now
+        point = (pose.x,pose.y)
+        if (self._nav_goal is None or dist(*target,*self._nav_goal) > NAV_TARGET_CHANGE_M
+                or self._nav_since is None or now < self._nav_since):
+            self._nav_anchor,self._nav_since,self._nav_goal = point,now,target
+            self._nav_detour = None
+        if dist(*point,*self._nav_anchor) >= NAV_PROGRESS_M:
+            self._nav_anchor,self._nav_since = point,now
+        if self._nav_detour is not None:
+            if (now < self._nav_detour_until and dist(*point,*self._nav_detour) > NAV_DETOUR_ARRIVE_M
+                    and segment_clear(point,self._nav_detour,obstacles)):
+                return self._nav_detour
+            self._nav_detour = None
+        if now-self._nav_since < NAV_STALL_S or dist(*point,*target) < ARRIVE_DIST:
+            return target
+        self.routing_blocked_until = now+NAV_ROLE_ROTATE_S
+        self._nav_attempt += 1
+        heading = angle_to(*point,*target)
+        offsets = NAV_ESCAPE_ANGLES if self._nav_attempt % 2 else tuple(-a for a in NAV_ESCAPE_ANGLES)
+        for offset in offsets:
+            a = heading+offset
+            candidate = legal_target(self.context,(pose.x+NAV_DETOUR_LENGTH_M*math.cos(a),
+                                     pose.y+NAV_DETOUR_LENGTH_M*math.sin(a)),
+                                     self.rule_discs,self.rule_own_half,ball_access=self.ball_access)
+            if (candidate is not None and dist(*point,*candidate) > NAV_DETOUR_ARRIVE_M
+                    and segment_clear(point,candidate,obstacles,GLOBAL_OBSTACLE_MARGIN_M)):
+                self._nav_detour,self._nav_detour_until = candidate,now+NAV_DETOUR_HOLD_S
+                self._nav_since = now
+                _log.info('NAV reroute player=%d attempt=%d target=(%.2f,%.2f)',self.id,self._nav_attempt,*candidate)
+                return candidate
+        self._nav_since = now
+        return target
+
     def walk_to(
         self,
         target: tuple[float, float],
@@ -374,6 +528,7 @@ class Player:
         avoid_ball: bool = False,
         avoid_robots: bool = False,
         arrive_dist: float = ARRIVE_DIST,
+        ball_access: bool = False,
     ) -> bool:
         """走向目标点。返回是否已到达。
 
@@ -382,12 +537,32 @@ class Player:
         目标 + 前方 ``PLAN_LOOKAHEAD`` 内不撞障碍"的方向前进。能处理多障碍、凹形
         结构和对称冲突,比单障碍绕行 / 势场排斥稳。
 
-        行走两种模式:近距离全向,远距离转身-走。``face`` 指定到达/近距离时的朝向。
+        全向行走，边走边转；``face`` 指定希望保持的朝向。
         """
         self.release_kick() # 踢球状态下，走位会被覆盖，先取消踢球状态
+        self.ball_access = ball_access and live_ball_access(self.context)
         pose = self.pose
-        if pose is None:
+        if pose is None or not self._motion_allowed() or self.is_fallen:
             self.stop()
+            return False
+
+        target = legal_target(self.context, target, self.rule_discs, self.rule_own_half,
+                              ball_access=self.ball_access)
+        if target is None:
+            self.stop()
+            return False
+        obstacles = collect_obstacles(self.context,self.id,ball=avoid_ball,robots=avoid_robots,goals=True)
+        obstacles.extend(self.rule_discs)
+        target = self._navigation_target(target,obstacles)
+        # 重摆球后已在禁圈内：先径向撤离，不等转身或规划。
+        if any(dist(pose.x,pose.y,c.x,c.y) < c.radius for c in self.rule_discs):
+            # 撤离也必须考虑门柱/球网，不能径直退进球门结构后卡住。
+            escape_obstacles = [*self.rule_discs,*collect_obstacles(
+                self.context,self.id,ball=False,robots=False,goals=True)]
+            wx,wy = safe_velocity(self.context,pose,target[0]-pose.x,target[1]-pose.y,
+                                  escape_obstacles,self.rule_own_half)
+            c,s = math.cos(pose.theta),math.sin(pose.theta)
+            self.set_velocity(wx*c+wy*s,-wx*s+wy*c,0.0)
             return False
 
         tx, ty = target
@@ -411,21 +586,18 @@ class Player:
         goal_dir = math.atan2(dy, dx)
         planned_path: list[tuple[float, float]] | None = None
         waypoint: tuple[float, float] | None = None
-        if (avoid_ball or avoid_robots) and self.context is not None:
-            obstacles = collect_obstacles(
-                self.context, self.id,
-                ball=avoid_ball, robots=avoid_robots,
-                goals=(avoid_ball or avoid_robots),
-            )
+        if not segment_clear((pose.x,pose.y),(tx,ty),obstacles,GLOBAL_OBSTACLE_MARGIN_M):
             if USE_GLOBAL_PATH_PLANNER:
                 planned_path = plan_global_path(
                     self.context,
                     (pose.x, pose.y),
                     (tx, ty),
                     obstacles,
+                    own_half=self.rule_own_half,
+                    ball_access=self.ball_access,
                 )
                 if planned_path is not None:
-                    waypoint = self._path_waypoint(pose, planned_path)
+                    waypoint = self._path_waypoint(pose, planned_path, obstacles)
                     heading = angle_to(pose.x, pose.y, waypoint[0], waypoint[1])
                 else:
                     heading = self._plan_heading(pose, goal_dir, obstacles)
@@ -458,51 +630,34 @@ class Player:
             rgb=(0.0, 0.8, 0.8), ns="lookahead",
         )
 
-        if distance <= OMNI_DIST:
-            # 近距离:全向行走,沿 heading 平移,同时转向 face
-            wdx, wdy = math.cos(heading) * distance, math.sin(heading) * distance
-            cos_t, sin_t = math.cos(pose.theta), math.sin(pose.theta)
-            vx = LINEAR_GAIN * (wdx * cos_t + wdy * sin_t)
-            vy = LINEAR_GAIN * (-wdx * sin_t + wdy * cos_t)
-            speed = math.hypot(vx, vy)
-            if speed > MAX_LINEAR:
-                vx *= MAX_LINEAR / speed
-                vy *= MAX_LINEAR / speed
-            vyaw = (
-                self._angular(normalize_angle(face - pose.theta))
-                if face is not None else 0.0
-            )
-            self.set_velocity(vx, vy, vyaw)
-        else:
-            # 远距离:转身-走-转身,朝 heading
-            angle_err = normalize_angle(heading - pose.theta)
-            if abs(angle_err) > TURN_THRESHOLD:
-                self.set_velocity(0.0, 0.0, self._angular(angle_err))
-            else:
-                vx = clamp(
-                    LINEAR_GAIN * distance * math.cos(angle_err), 0.0, MAX_LINEAR,
-                )
-                self.set_velocity(vx, 0.0, self._angular(angle_err))
+        # 全向走位，追球时不原地等待转身。
+        # 近距离:全向行走,沿 heading 平移,同时转向 face
+        travel = min(distance,dist(pose.x,pose.y,*waypoint)) if waypoint is not None else distance
+        wdx, wdy = math.cos(heading) * travel, math.sin(heading) * travel
+        cos_t, sin_t = math.cos(pose.theta), math.sin(pose.theta)
+        vx = LINEAR_GAIN * (wdx * cos_t + wdy * sin_t)
+        vy = LINEAR_GAIN * (-wdx * sin_t + wdy * cos_t)
+        speed = math.hypot(vx, vy)
+        if speed > MAX_LINEAR:
+            vx *= MAX_LINEAR / speed
+            vy *= MAX_LINEAR / speed
+        vyaw = (
+            self._angular(normalize_angle(face - pose.theta))
+            if face is not None else 0.0
+        )
+        self.set_velocity(vx, vy, vyaw)
         return False
 
     def _path_waypoint(
-        self, pose: Pose2D, path: list[tuple[float, float]],
+        self, pose: Pose2D, path: list[tuple[float, float]], obstacles=(),
     ) -> tuple[float, float]:
         """Pick a short lookahead waypoint from a planned global path."""
-        if not path:
-            return (pose.x, pose.y)
-        prev = (pose.x, pose.y)
-        points = path[1:] if len(path) > 1 else path
-        for point in points:
-            seg_len = dist(prev[0], prev[1], point[0], point[1])
-            if seg_len >= GLOBAL_PATH_LOOKAHEAD_M:
-                ratio = GLOBAL_PATH_LOOKAHEAD_M / max(seg_len, 1e-6)
-                return (
-                    prev[0] + (point[0] - prev[0]) * ratio,
-                    prev[1] + (point[1] - prev[1]) * ratio,
-                )
-            prev = point
-        return path[-1]
+        # 只跳到当前可直达点，避免反复追逐身后的栅格中心或切穿障碍。
+        visible = [p for p in path if segment_clear((pose.x,pose.y),p,obstacles,GLOBAL_OBSTACLE_MARGIN_M)]
+        for point in reversed(visible):
+            if dist(pose.x,pose.y,*point) > ARRIVE_DIST:
+                return point
+        return path[-1] if path else (pose.x,pose.y)
 
     def _plan_heading(
         self, pose: Pose2D, goal_dir: float, obstacles: list,
@@ -536,6 +691,64 @@ class Player:
     # 高层动作(策略在 main.py 里直接调这些)
     # ------------------------------------------------------------------
 
+    def clearance_target(self):
+        ball = self.context.ball
+        side = 1.0 if ball.y >= 0 else -1.0
+        return (min(self.context.field.length/2-FIELD_SAFE_MARGIN_M,
+                    ball.x+GOAL_CLEAR_FORWARD_M),side*GOAL_CLEAR_SIDE_M)
+
+    def play_ball(self,intercept,target,power):
+        ball,pose = self.context.ball,self.pose
+        if ball is None or pose is None:
+            self.stop()
+            return
+        d = dist(pose.x,pose.y,ball.x,ball.y)
+        speed = self.ball_motion.speed if self.ball_motion is not None else 0.0
+        if speed>RECEIVE_SPEED_MPS and d>(KICK_EXIT_M if self.is_kicking else BALL_KICK_ENGAGE_M):
+            # 远处快球先拦截；近身与已启动任务保持 SDK 连续控制。
+            self.walk_to(intercept or (ball.x,ball.y),avoid_robots=True,ball_access=True)
+            return
+        if d <= BALL_KICK_ENGAGE_M or (self.is_kicking and d <= KICK_EXIT_M):
+            self.kick(angle_to(ball.x,ball.y,*target),power)
+        else:
+            approach = intercept or (ball.x,ball.y)
+            if goal_danger(self.context):
+                # 不为绕到球后站位而把目标放进球网；从场内侧接近活球。
+                approach = (max(approach[0],-self.context.field.length/2+FIELD_SAFE_MARGIN_M),approach[1])
+            else:
+                approach = _behind_ball(*approach,target,CHASE_BEHIND_M)
+            self.walk_to(approach,avoid_robots=True,ball_access=True)
+
+    def defend_goal(self,target):
+        """门前封堵不避开球；来球近身立即交给持续解围任务。"""
+        ball,pose = self.context.ball,self.pose
+        if ball is None or pose is None:
+            self.stop()
+            return
+        reach = dist(pose.x,pose.y,ball.x,ball.y)
+        motion = self.ball_motion
+        incoming = (motion is not None and motion.speed > KEEPER_FAST_SHOT_MPS
+                    and motion.velocity[0] < KEEPER_INCOMING_VX_MPS
+                    and ball.x > pose.x+KEEPER_GOALSIDE_MARGIN_M)
+        if reach <= KEEPER_CLEAR_REACH_M and (not incoming or reach <= KEEPER_FOOT_REACH_M):
+            self.kick(angle_to(ball.x,ball.y,*self.clearance_target()),SHOT_POWER)
+        else:
+            self.walk_to(target,face=angle_to(pose.x,pose.y,ball.x,ball.y),
+                         avoid_ball=False,avoid_robots=True,ball_access=True)
+
+    def receive_ball(self,target):
+        """接球路线不把球当障碍；到达后保留迎球姿态，慢球近身再出球。"""
+        ball,pose = self.context.ball,self.pose
+        if ball is None or pose is None:
+            self.stop()
+            return
+        speed = self.ball_motion.speed if self.ball_motion is not None else 0.0
+        if dist(pose.x,pose.y,ball.x,ball.y) <= RECEIVE_REACH_M and speed <= RECEIVE_SPEED_MPS:
+            self.play_ball((ball.x,ball.y),opponent_goal(self.context),PASS_POWER_MAX)
+            return
+        self.walk_to(target,face=angle_to(pose.x,pose.y,ball.x,ball.y),
+                     avoid_ball=False,avoid_robots=True,ball_access=True)
+
 
     def block_path_projection(
         self, opponent_id: int,
@@ -567,7 +780,7 @@ class Player:
         """追球射门。踢向 ``kick_target``(默认对方球门中心)。
 
         踢球迟滞:距球 ≤ ENTER 进入踢球;进入后距球 > EXIT 才退出(EXIT > ENTER),
-        防边界抖动。不避障——正常拼抢要直取球。追球目标设在【球后方】(球→球门连线
+        防边界抖动。行走追球时避机器人，SDK 踢球阶段由 kick 统一限制。追球目标设在【球后方】(球→球门连线
         上、背离球门退 ``CHASE_BEHIND_M``),到位时天然对准射门方向。
         """
         ball = self.context.ball if self.context is not None else None
@@ -580,16 +793,12 @@ class Player:
         d = dist(self.pose.x, self.pose.y, ball.x, ball.y)
         self._kicking = d <= (KICK_EXIT_M if self._kicking else KICK_ENTER_M)
         if self._kicking:
-            kick_plan = self.plan_kick()
-            if kick_plan is None:
-                self.stop()
-                return
-            kick_direction, kick_power = kick_plan
-            self.kick(kick_direction, kick_power)
+            self.kick(angle_to(ball.x,ball.y,*kick_target), KICK_POWER_DEFAULT)
         else:
             self.release_kick()
             self.walk_to(
-                _behind_ball(ball.x, ball.y, kick_target, CHASE_BEHIND_M)
+                _behind_ball(ball.x, ball.y, kick_target, CHASE_BEHIND_M),
+                avoid_robots=True,
             )
 
     def guard(self) -> None:
@@ -604,6 +813,8 @@ class Player:
             return
 
         ball = self.context.ball if self.context is not None else None
+        home = (max(home[0],-self.context.field.length/2
+                    +self.context.field.goal_area_length+FIELD_SAFE_MARGIN_M),home[1])
 
         # 待命朝向:朝球(便于快速反应);球不可见则朝对方门方向(默认 0)。
         face = 0.0
@@ -616,7 +827,7 @@ class Player:
         debugdraw.point(
             home[0], home[1], rgb=(0.0, 0.6, 1.0), scale=0.2, ns="guard_home",
         )
-        self.walk_to(home, face=face, avoid_ball=True, avoid_robots=True)
+        self.wait_away(home)
 
     def support(self) -> None:
         """支援:站在 球→己方门中心 连线上距球 ``SUPPORT_DIST_M`` 处补防。
@@ -624,7 +835,7 @@ class Player:
         站位点在球与己方门之间的封堵线上。
         """
         ctx = self.context
-        if ctx is None:
+        if ctx is None or ctx.ball is None:
             self.stop()
             return
 
@@ -646,7 +857,74 @@ class Player:
         half_w = ctx.field.width / 2.0 - 0.3
         tx = clamp(tx, -half_l + 0.3, half_l)
         ty = clamp(ty, -half_w, half_w)
-        self.move_to_position((tx, ty))
+        self.wait_away((tx, ty))
+
+    def wait_away(self, target) -> None:
+        """合法等待点离球 3 m 以外；不是用微小抖动规避无活动。"""
+        ball = self.context.ball if self.context is not None else None
+        if ball is None:
+            self.stop()
+            return
+        discs = [*self.rule_discs, Obstacle(ball.x,ball.y,WAIT_BALL_DISTANCE_M)]
+        target = legal_target(self.context,target,discs,self.rule_own_half)
+        self.rule_discs = discs  # 本帧整段行走也避让，下一帧由状态机重置
+        self.move_to_position(target)
+
+    def recover_inactivity(self, *, emergency=False) -> bool:
+        """仅用本地时钟防卡住；不用于球权开放、重启或返场判断。"""
+        ctx,pose = self.context,self.pose
+        ball = ctx.ball if ctx is not None else None
+        if not self._motion_allowed() or ctx.game.state != GameState.PLAYING or pose is None or ball is None:
+            self._activity_anchor = self._activity_since = None
+            self._retreating = False
+            self._rescue_target = None
+            return False
+        near = dist(pose.x,pose.y,ball.x,ball.y) <= INACTIVITY_BALL_DISTANCE_M
+        if not near:
+            self._activity_anchor = (pose.x,pose.y)
+            self._activity_since = ctx.now
+            self._retreating = False
+            self._rescue_target = None
+            return False
+        if (self._activity_anchor is None or self._activity_since is None
+                or ctx.now < self._activity_since
+                or dist(pose.x,pose.y,*self._activity_anchor) >= INACTIVITY_PROGRESS_M):
+            self._activity_anchor = (pose.x,pose.y)
+            self._activity_since = ctx.now
+            if emergency:
+                # 已完成真实换位即可重新参与救险，不一直退到球外 3.6 m。
+                self._retreating = False
+                self._rescue_target = None
+        if ctx.now-self._activity_since >= INACTIVITY_RECOVERY_S:
+            if not self._retreating:
+                _log.info("player %d inactivity retreat: pose=(%.2f,%.2f) ball=(%.2f,%.2f)",
+                          self.id,pose.x,pose.y,ball.x,ball.y)
+            self._retreating = True
+        if self._retreating:
+            if emergency:
+                if self._rescue_target is None:
+                    obstacles = collect_obstacles(ctx,self.id,ball=False,robots=True,goals=True)
+                    candidates = []
+                    for i in range(RULE_ANGLE_SAMPLES):
+                        a = math.tau*i/RULE_ANGLE_SAMPLES
+                        t = legal_target(ctx,(pose.x+ACTIVE_REPOSITION_M*math.cos(a),
+                                              pose.y+ACTIVE_REPOSITION_M*math.sin(a)),self.rule_discs)
+                        if (t is not None and dist(pose.x,pose.y,*t) >= ACTIVE_REPOSITION_M/2
+                                and dist(ball.x,ball.y,*t) >= ACTIVE_REPOSITION_MIN_BALL_M):
+                            clear = segment_clear((pose.x,pose.y),t,obstacles,GLOBAL_OBSTACLE_MARGIN_M)
+                            candidates.append((clear,dist(ball.x,ball.y,*t),t))
+                    if candidates:
+                        self._rescue_target = max(candidates,key=lambda c:(c[0],c[1]))[2]
+                self.action = "goal:reposition" if goal_danger(ctx) else "unstick:reposition"
+                self.routing_blocked_until = ctx.now+NAV_ROLE_ROTATE_S
+                if self._rescue_target is not None:
+                    self.walk_to(self._rescue_target,avoid_robots=True)
+                else:
+                    self.stop()
+                return True
+            self.action = "unstick:retreat"
+            self.wait_away((pose.x,pose.y))
+        return self._retreating
 
     def take_kickoff(self, kick_target: tuple[float, float] | None = None) -> None:
         """我方开球/重开:未就位则绕到球后待命(避球不碰),就位后接近并踢。"""
