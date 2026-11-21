@@ -32,7 +32,7 @@ class TacticalScenarios(unittest.TestCase):
                 ctx=replace(context(teams=(TeamState(team_number=1,score=3+margin),
                                           TeamState(team_number=2,score=3)),secs_remaining=1),ball=BallState(3.,0.))
                 self.tick(ctx)
-                self.assertEqual(self.store.tactics.mode,mode)
+                self.assertEqual(self.store.tactics.mode,'possession')
 
     def test_attack_support_advances_while_keeper_covers_when_losing(self):
         ctx=replace(context(teams=(TeamState(team_number=1),TeamState(team_number=2,score=1))),
@@ -46,7 +46,8 @@ class TacticalScenarios(unittest.TestCase):
     def test_ready_all_players_move_towards_midfield_from_deep_positions(self):
         self.tick(context(GameState.READY))
         self.assertTrue(all(t[0]>=READY_BASE_X_M for t in self.store.ready_targets.values()))
-        self.assertEqual(sum(t[0]==READY_PRESS_X_M for t in self.store.ready_targets.values()),2)
+        self.assertEqual({t[0] for t in self.store.ready_targets.values()},
+                         {READY_BASE_X_M,OPP_KICKOFF_FRONT_X_M,OPP_KICKOFF_BACK_X_M})
 
     def test_goal_cover_intercepts_without_avoiding_incoming_ball(self):
         p=self.players[0]
@@ -69,7 +70,7 @@ class TacticalScenarios(unittest.TestCase):
         self.tick(replace(ctx,game=replace(ctx.game,stopped=True)))
         self.assertFalse(self.players[0].is_kicking)
 
-    def test_fast_goal_danger_preserves_keeper_block_and_slow_ball_clears(self):
+    def test_near_fast_goal_danger_immediately_assigns_keeper_clearance(self):
         ctx=replace(context(),ball=BallState(-5.8,0.),teammates={
             1:RobotState(1,Pose2D(-6.5,0.)),2:RobotState(2,Pose2D(-4.,1.)),
             3:RobotState(3,Pose2D(0.,-1.))})
@@ -80,11 +81,11 @@ class TacticalScenarios(unittest.TestCase):
         motion.position=(-5.8,0.)
         motion.velocity=(-3.,0.)
         intents=self.store.tactics.plan(ctx,self.players,motion)
-        self.assertEqual(intents[1].role,'cover:goal')
+        self.assertEqual(intents[1].role,'goal:clear')
         keeper=self.players[0]
         keeper.ball_motion=motion
         keeper.defend_goal(intents[1].target)
-        self.assertFalse(keeper.is_kicking)
+        self.assertTrue(keeper.is_kicking)
         motion.velocity=(0.,0.)
         intents=self.store.tactics.plan(ctx,self.players,motion)
         self.assertEqual(intents[1].role,'goal:clear')
@@ -109,14 +110,15 @@ class TacticalScenarios(unittest.TestCase):
         self.assertEqual(sum(p._nav_goal[0]>-2. for p in support),1)
         self.assertEqual(sum(p._nav_goal[0]<-5. for p in support),1)
 
-    def test_keeper_does_not_abandon_goal_for_ball_two_metres_away(self):
+    def test_keeper_contests_near_goal_ball_before_distant_teammates(self):
         ctx=replace(context(),ball=BallState(-4.5,0.),teammates={
             1:RobotState(1,Pose2D(-6.5,0.)),2:RobotState(2,Pose2D(0.,1.)),
             3:RobotState(3,Pose2D(1.,-1.))})
         self.tick(ctx)
-        self.assertEqual(self.players[0].action,'cover:goal')
-        self.assertFalse(self.players[0].is_kicking)
-        self.assertEqual(self.store.tactics.anchor_id,1)
+        self.assertEqual(self.players[0].action,'penalty:clear')
+        self.assertTrue(self.players[0].is_kicking)
+        self.assertNotEqual(self.store.tactics.anchor_id,1)
+        self.assertEqual(sum(p.action=='cover:goal' for p in self.players),1)
 
     def test_three_unique_man_marks_with_ball_goal_blocking(self):
         ctx=replace(context(),ball=BallState(1.,0.),opponents={
@@ -124,11 +126,12 @@ class TacticalScenarios(unittest.TestCase):
         self.tick(ctx)
         mapping=self.store.tactics.mark_assignments
         self.assertEqual(len(set(mapping.values())),3)
-        press=next(p for p in self.players if p.action=='press:goalside')
+        press=next(p for p in self.players if p.action=='press:approach')
         self.assertEqual(mapping[press.id],4)
-        self.assertLess(press._nav_goal[0],ctx.ball.x)
+        self.assertEqual(press._nav_goal[0],ctx.ball.x)
         self.assertAlmostEqual(press._nav_goal[1],0.)
-        self.assertEqual(sum(p.action.startswith('mark:') for p in self.players),2)
+        self.assertEqual(sum(p.action=='cover:goal' for p in self.players),1)
+        self.assertEqual(sum(p.action=='press:outlet' for p in self.players),1)
 
     def test_sideline_ball_can_be_kicked_inward_from_outside(self):
         ctx=replace(context(),ball=BallState(0.,4.45),teammates={1:RobotState(1,Pose2D(0.,4.7))})
@@ -244,15 +247,16 @@ class TacticalScenarios(unittest.TestCase):
         ctx=replace(context(),ball=BallState(-2.,0.),opponents={
             4:RobotState(4,Pose2D(-2.,.1)),5:RobotState(5,Pose2D(4.,3.)),6:RobotState(6,Pose2D(5.,-3.))})
         self.tick(ctx)
-        self.assertEqual(len(set(self.store.tactics.mark_assignments.values())),3)
-        cover=next(p for p in self.players if p.action=='mark:goal_cover')
+        self.assertEqual(sum(p.action=='press:outlet' for p in self.players),1)
+        cover=next(p for p in self.players if p.action=='cover:goal')
         self.assertLess(cover._nav_goal[0],-5.)
 
-    def test_ready_outside_player_first_returns_to_nearest_legal_point(self):
+    def test_ready_outside_player_directly_targets_formation(self):
         ctx=replace(context(GameState.READY),teammates={1:RobotState(1,Pose2D(3.,4.7))})
         self.tick(ctx)
         p=self.players[0]
-        self.assertEqual(p.action,'ready:legal_first')
+        self.assertEqual(p.action,'ready:midfield')
+        self.assertEqual(p._nav_goal,self.store.ready_targets[p.id])
         self.assertLess(p._nav_goal[0],0.)
         self.assertLessEqual(abs(p._nav_goal[1]),ctx.field.width/2-FIELD_SAFE_MARGIN_M)
 

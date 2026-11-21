@@ -153,7 +153,11 @@ class BallMotion:
         for i in range(steps+1):
             t = i*BALL_PREDICTION_STEP_S
             point = self.predict(context,t)
-            walk_time = max(0.0,math.dist((pose.x,pose.y),point)-BALL_INTERCEPT_REACH_M)/BALL_WALK_SPEED_MPS
+            distance = math.dist((pose.x,pose.y),point)
+            heading = math.atan2(point[1]-pose.y,point[0]-pose.x)
+            turn = abs(math.atan2(math.sin(heading-pose.theta),math.cos(heading-pose.theta)))
+            walk_time = (max(0.0,distance-BALL_INTERCEPT_REACH_M)/BALL_WALK_SPEED_MPS
+                         + (turn*BALL_TURN_LATENCY_S_PER_RAD if distance>OMNI_DIST else 0.0))
             cost = max(walk_time,t)
             if cost < best_cost:
                 best,best_cost = point,cost

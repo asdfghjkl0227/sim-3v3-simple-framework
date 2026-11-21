@@ -1,5 +1,6 @@
 """纯几何合规工具；只使用官方 Context，不推断裁判放行或触球身份。"""
 import math
+from typing import Sequence, overload
 
 from ..param import (
     FIELD_SAFE_MARGIN_M, HALF_SAFE_MARGIN_M, RULE_TARGET_MARGIN_M,
@@ -8,8 +9,10 @@ from ..param import (
     GOAL_DANGER_DEPTH_M, GOAL_DANGER_WIDTH_MARGIN_M,
     LIVE_BALL_FIELD_MARGIN_M, TOUCHLINE_ZONE_M, TOUCHLINE_ROBOT_EXCURSION_M,
     GOAL_DEPTH, GOAL_RESCUE_BACK_MARGIN_M, GOAL_RESCUE_POST_MARGIN_M,
+    RESTART_INWARD_MIN_SIN,
 )
-from ..framework.types import GameState, SetPlay
+from ..framework.types import Context, GameState, SetPlay
+from .obstacles import Obstacle
 
 
 def bounds(context, own_half=False, ball_access=False):
@@ -60,6 +63,16 @@ def segment_clear(start, end, discs, margin=0.0):
         if math.hypot(start[0]+t*dx-c.x, start[1]+t*dy-c.y) < c.radius + margin:
             return False
     return True
+
+
+@overload
+def legal_target(context: Context, target: tuple[float,float], discs: tuple[()] = (),
+                 own_half: bool = False, *, ball_access: bool = False) -> tuple[float,float]: ...
+
+
+@overload
+def legal_target(context: Context, target: tuple[float,float], discs: Sequence[Obstacle],
+                 own_half: bool = False, *, ball_access: bool = False) -> tuple[float,float] | None: ...
 
 
 def legal_target(context, target, discs=(), own_half=False, *, ball_access=False):
@@ -123,15 +136,21 @@ def safe_velocity(context, pose, vx, vy, discs=(), own_half=False, *, ball_acces
     return min(radial or candidates, key=lambda p: (p[0]-vx)**2+(p[1]-vy)**2) if candidates else (0.0,0.0)
 
 
-def safe_push_direction(context):
+def safe_push_direction(context,preferred=None):
     """轻推离开摆球点：排除两侧球门方向，并优先把球留在场内。"""
     ball = context.ball
     if ball is None: return None
     lo,hi,bottom,top = bounds(context)
     candidates = []
-    for i in range(RULE_ANGLE_SAMPLES):
-        a = math.tau*i/RULE_ANGLE_SAMPLES
+    angles = [math.tau*i/RULE_ANGLE_SAMPLES for i in range(RULE_ANGLE_SAMPLES)]
+    if preferred is not None:
+        angles.insert(0,preferred)
+    for a in angles:
         dx,dy = math.cos(a), math.sin(a)
+        if abs(ball.y) > context.field.width/2-TOUCHLINE_ZONE_M:
+            # 边线重启先取得足够向内角度，避免浅角度轻推仍贴线滚出。
+            if dy*(1.0 if ball.y>0 else -1.0) > -RESTART_INWARD_MIN_SIN:
+                continue
         unsafe = False
         for goal_x in (-context.field.length/2, context.field.length/2):
             if abs(dx) < 1e-6: continue
@@ -142,4 +161,7 @@ def safe_push_direction(context):
         if not unsafe and lo <= end[0] <= hi and bottom <= end[1] <= top:
             candidates.append((a, dx))
     # 前斜向出球，开球时从本方半场接近球。
+    if preferred is not None and candidates:
+        return min(candidates,key=lambda item:abs(math.atan2(
+            math.sin(item[0]-preferred),math.cos(item[0]-preferred))))[0]
     return max(candidates, key=lambda item: item[1])[0] if candidates else None

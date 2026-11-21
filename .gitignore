@@ -10,7 +10,14 @@ logs/
 # Local simulation backups and machine-specific verification output
 /strategy-before-*.zip
 /winning-strategy-*.zip
+/five-win-v*.zip
+/six-win-v*.zip
 /docs/winning-source-sha256.json
+/docs/evidence/
+
+# Local temporary files
+*.tmp
+*.temp
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

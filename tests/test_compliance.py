@@ -113,6 +113,7 @@ class ComplianceTests(unittest.TestCase):
         p=self.players[0]
         ctx=context(kicking_team=1,secondary_time=10)
         ctx.teammates[1]=RobotState(1,Pose2D(-0.2,-0.2,0.))
+        ctx.teammates[2]=RobotState(2,Pose2D(KICKOFF_RECEIVER_X_M,KICKOFF_RECEIVER_Y_M,0.))
         self.tick(ctx)
         self.assertEqual(self.store.kickoff_taker,1)
         self.assertTrue(any(c[0]=='kick' for c in p._backend.calls))
@@ -166,10 +167,13 @@ class ComplianceTests(unittest.TestCase):
         p.set_velocity(2.,1.,1.);p.kick();p.get_up();p.request_mode('walk')
         self.assertFalse(any(c[0] in ('kick','get_up','mode') for c in p._backend.calls))
         self.assertEqual(p._backend.calls[-1],('velocity',0.,0.,0.))
-    def test_wait_target_and_path_outside_three_metres(self):
+    def test_opponent_restart_screen_stays_outside_official_avoidance_circle(self):
         self.tick(context(set_play=SetPlay.THROW_IN,kicking_team=2))
         for p in self.players:
-            self.assertTrue(any(c.radius==WAIT_BALL_DISTANCE_M for c in p.rule_discs))
+            self.assertTrue(any(c.radius==OPPONENT_RESTART_AVOID_M for c in p.rule_discs))
+            self.assertFalse(p.rule_can_kick)
+            self.assertGreaterEqual(math.hypot(*p._nav_goal),
+                                    OPPONENT_RESTART_AVOID_M+RULE_TARGET_MARGIN_M)
     def test_inactivity_triggers_real_retreat(self):
         p=self.players[0];p.context=context()
         self.assertFalse(p.recover_inactivity())
